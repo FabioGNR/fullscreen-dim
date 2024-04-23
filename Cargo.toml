@@ -6,5 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
 ddc = "0.2.2"
 ddc-i2c = { version="0.2.2", features=["with-linux", "with-linux-enumerate"] }
+edid = "0.3.0"
+i2c-linux = "0.1.2"
+udev = "0.8.0"
