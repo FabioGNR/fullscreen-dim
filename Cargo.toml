@@ -11,4 +11,6 @@ ddc = "0.2.2"
 ddc-i2c = { version="0.2.2", features=["with-linux", "with-linux-enumerate"] }
 edid = "0.3.0"
 i2c-linux = "0.1.2"
-udev = "0.8.0"
+libwmctl = "0.0.45"
+udev = "0.2.0"
+xrandr = "0.2.0"
