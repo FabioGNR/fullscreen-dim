@@ -10,6 +10,7 @@ Currently only X11 is supported to check for fullscreen applications.
     Options:
     -i, --ignore <IGNORE>                Displays to ignore (displays that match this enum are not dimmed)
         --ignore-apps <IGNORE_APPS>      Apps to ignore (apps containing this string in name are skipped)
+        --focused-only                   Only look at the focused app
     -f, --fade-time <FADE_TIME>          Fade time in milliseconds
         --poll-interval <POLL_INTERVAL>  Poll interval in milliseconds (time to wait between checking for fullscreen apps)
         --fade-interval <FADE_INTERVAL>  Fade interval in milliseconds (time to wait between sending brightness updates)

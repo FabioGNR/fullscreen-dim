@@ -29,6 +29,10 @@ struct Args {
     #[arg(long)]
     ignore_apps: Vec<String>,
 
+    /// Only look at the focused app
+    #[arg(long)]
+    focused_only: bool,
+
     /// Fade time in milliseconds
     #[arg(short, long)]
     fade_time: Option<u64>,
@@ -147,21 +151,40 @@ fn get_compatible_screens() -> Result<impl Iterator<Item = Screen>, std::io::Err
     Ok(enumerator.filter_map(|x| Screen::new(x.0, &x.1)))
 }
 
-fn get_fullscreen_app(ignore_apps: &Vec<String>) -> Result<Option<Geometry>, libwmctl::ErrorWrapper> {
-    let wmctl = WmCtl::connect()?;
-    'windows: for win in wmctl.windows(false)? {
-        let name = wmctl.win_name(win)?;
+fn is_eligible_fullscreen_window(wmctl: &WmCtl, window: u32, ignore_apps: &Vec<String>) ->  Result<Option<Geometry>, libwmctl::ErrorWrapper> {
+    let name = wmctl.win_name(window);
+    if let Ok(name) = name {
         for ignore in ignore_apps {
             if name.contains(ignore) {
-                continue 'windows;
+                return Ok(None);
             }
         }
+    } else {
+        return Ok(None);
+    }
 
-        let states = wmctl.win_state(win);
-        if let Ok(states) = states {
-            if states.contains(&libwmctl::WinState::Fullscreen) {
-                let geometry = wmctl.win_geometry(win)?;
-                return Ok(Some(Geometry::from_window(geometry.0, geometry.1, geometry.2, geometry.3)));
+    let states = wmctl.win_state(window);
+    if let Ok(states) = states {
+        if states.contains(&libwmctl::WinState::Fullscreen) {
+            let geometry = wmctl.win_geometry(window)?;
+            return Ok(Some(Geometry::from_window(geometry.0, geometry.1, geometry.2, geometry.3)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn get_fullscreen_app(wmctl: &WmCtl, ignore_apps: &Vec<String>, focused_only: bool) -> Result<Option<Geometry>, libwmctl::ErrorWrapper> {
+    if focused_only {
+        let active_window = wmctl.active_win()?;
+        return is_eligible_fullscreen_window(wmctl, active_window, ignore_apps);
+    }
+
+    for win in wmctl.windows(false)? {
+        let fullscreen_geometry = is_eligible_fullscreen_window(wmctl, win, ignore_apps);
+        if let Ok(fullscreen_geometry) = fullscreen_geometry {
+            if fullscreen_geometry.is_some() {
+                return Ok(fullscreen_geometry);
             }
         }
     }
@@ -200,9 +223,10 @@ fn main() {
     }
 
     let mut last_fullscreen_app: Option<Geometry> = None;
+    let wmctl = WmCtl::connect().unwrap();
 
     loop {
-        let fullscreen_app = get_fullscreen_app(&args.ignore_apps).unwrap();
+        let fullscreen_app = get_fullscreen_app(&wmctl, &args.ignore_apps, args.focused_only).unwrap();
         let fade_out = fullscreen_app.is_some();
         if fullscreen_app != last_fullscreen_app {
             println!("Fading {}", if fade_out { "out" } else { "in" });
