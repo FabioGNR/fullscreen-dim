@@ -11,7 +11,7 @@ use udev::Device;
 use xrandr::Monitor;
 
 use crate::ddc::Edid;
-use std::os::unix::ffi::OsStrExt;
+use std::{os::unix::ffi::OsStrExt, rc::Rc};
 
 use ddc::{Ddc, FeatureCode};
 use ddc_i2c::I2cDdc;
@@ -48,7 +48,7 @@ struct Args {
 
 const BRIGHTNESS: FeatureCode = 0x10;
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 struct Geometry(i32,i32,i32,i32);
 
 impl Geometry {
@@ -61,12 +61,18 @@ impl Geometry {
     }
 }
 
+struct Application {
+    geometry: Geometry,
+    name: Option<String>
+}
+
 struct Screen {
     ddc: I2cDdc<I2c<std::fs::File>>,
     default_brightness: u16,
     current_brightness: u16,
     name: String,
-    edid: EDID
+    edid: EDID,
+    monitor: Option<Rc<X11Monitor>>
 }
 
 impl Screen {
@@ -103,7 +109,8 @@ impl Screen {
                         default_brightness: if product_name == "DM-163BD-MPGR" { 50 } else { maximum_brightness },
                         current_brightness,
                         name: product_name.to_owned(),
-                        edid: edid.1
+                        edid: edid.1,
+                        monitor: None
                     });
                 },
                 _ => continue
@@ -145,15 +152,16 @@ impl X11Monitor {
         self.outputs.contains(&edid)
     }
 }
+
 fn get_compatible_screens() -> Result<impl Iterator<Item = Screen>, std::io::Error> {
     let enumerator = i2c_linux::Enumerator::new()?;
     
     Ok(enumerator.filter_map(|x| Screen::new(x.0, &x.1)))
 }
 
-fn is_eligible_fullscreen_window(wmctl: &WmCtl, window: u32, ignore_apps: &Vec<String>) ->  Result<Option<Geometry>, libwmctl::ErrorWrapper> {
+fn is_eligible_fullscreen_window(wmctl: &WmCtl, window: u32, ignore_apps: &Vec<String>) ->  Result<Option<Application>, libwmctl::ErrorWrapper> {
     let name = wmctl.win_name(window);
-    if let Ok(name) = name {
+    if let Ok(name) = &name {
         for ignore in ignore_apps {
             if name.contains(ignore) {
                 return Ok(None);
@@ -167,22 +175,23 @@ fn is_eligible_fullscreen_window(wmctl: &WmCtl, window: u32, ignore_apps: &Vec<S
     if let Ok(states) = states {
         if states.contains(&libwmctl::WinState::Fullscreen) {
             let geometry = wmctl.win_geometry(window)?;
-            return Ok(Some(Geometry::from_window(geometry.0, geometry.1, geometry.2, geometry.3)));
+            let geometry = Geometry::from_window(geometry.0, geometry.1, geometry.2, geometry.3);
+            return Ok(Some(Application { geometry, name: name.ok() }));
         }
     }
 
     Ok(None)
 }
 
-fn get_fullscreen_app(wmctl: &WmCtl, ignore_apps: &Vec<String>, focused_only: bool) -> Result<Option<Geometry>, libwmctl::ErrorWrapper> {
+fn get_fullscreen_app(wmctl: &WmCtl, ignore_apps: &Vec<String>, focused_only: bool) -> Result<Option<Application>, libwmctl::ErrorWrapper> {
     if focused_only {
         let active_window = wmctl.active_win()?;
         return is_eligible_fullscreen_window(wmctl, active_window, ignore_apps);
     }
 
     for win in wmctl.windows(false)? {
-        let fullscreen_geometry = is_eligible_fullscreen_window(wmctl, win, ignore_apps);
-        if let Ok(fullscreen_geometry) = fullscreen_geometry {
+        let fullscreen_app = is_eligible_fullscreen_window(wmctl, win, ignore_apps);
+        if let Ok(fullscreen_geometry) = fullscreen_app {
             if fullscreen_geometry.is_some() {
                 return Ok(fullscreen_geometry);
             }
@@ -200,65 +209,88 @@ fn is_screen_fullscreen(app_geometry: Option<&Geometry>, monitor: Option<&X11Mon
     return false;
 }
 
+struct FadeTiming {
+    duration: std::time::Duration,
+    interval: std::time::Duration
+}
+
 fn main() {
     let args = Args::parse();
 
-    let fade_time = std::time::Duration::from_millis(args.fade_time.unwrap_or(1000));
-    let fade_interval = std::time::Duration::from_millis(args.fade_interval.unwrap_or(10));
-    let poll_interval = std::time::Duration::from_millis(args.poll_interval.unwrap_or(500));
-
-    let x11_monitors: Vec<X11Monitor> = {
-        let mut handle = xrandr::XHandle::open().unwrap();
-        handle.monitors().unwrap().iter().map(X11Monitor::new).collect()
+    let fade_timing = {
+        let duration = std::time::Duration::from_millis(args.fade_time.unwrap_or(1000));
+        let interval = std::time::Duration::from_millis(args.fade_interval.unwrap_or(10));
+        FadeTiming { duration, interval } 
     };
 
-    let mut screens_to_fade: Vec<Screen> = get_compatible_screens().unwrap()
-        .filter(|s| !args.ignore.contains(&s.name)).collect();
-    let mut screen_to_monitor: Vec<Option<&X11Monitor>> = vec![];
+    let poll_interval = std::time::Duration::from_millis(args.poll_interval.unwrap_or(500));
 
-    for screen in &screens_to_fade {
-        println!("Screen {:?}, default {:?}, current {:?}", screen.name, screen.default_brightness, screen.current_brightness);
-        let monitor = x11_monitors.iter().find(|m| m.has_edid(&screen.edid));
-        screen_to_monitor.push(monitor);
-    }
+    let mut screens_to_fade = get_screens(&args);
 
-    let mut last_fullscreen_app: Option<Geometry> = None;
+    let mut last_fullscreen_geometry: Option<Geometry> = None;
     let wmctl = WmCtl::connect().unwrap();
 
     loop {
         let fullscreen_app = get_fullscreen_app(&wmctl, &args.ignore_apps, args.focused_only).unwrap();
+
         let fade_out = fullscreen_app.is_some();
-        if fullscreen_app != last_fullscreen_app {
-            println!("Fading {}", if fade_out { "out" } else { "in" });
-            let start_time = std::time::Instant::now();
-            loop {
-                let now = std::time::Instant::now();
-                let elapsed = now - start_time;
-                let progress = elapsed.as_secs_f64() / fade_time.as_secs_f64();
-
-                for (i, screen) in screens_to_fade.iter_mut().enumerate() {
-                    let is_fullscreen = is_screen_fullscreen(fullscreen_app.as_ref(), screen_to_monitor[i]);
-                    let fade_out_screen = fade_out && !is_fullscreen;
-                    if (fade_out_screen && screen.current_brightness == 0) || (!fade_out_screen && screen.current_brightness >= screen.default_brightness) {
-                        continue;
-                    }
-                    let brightness = if fade_out_screen {
-                        (1.0 - progress) * screen.default_brightness as f64
-                    } else { 
-                        progress * screen.default_brightness as f64 
-                    };
-                    
-                    screen.set_brightness(brightness as u16);
-                }
-
-                if progress >= 1.0 {
-                    break;
-                }
-                
-                std::thread::sleep(fade_interval);
+        let geometry = fullscreen_app.as_ref().and_then(|a| Some(a.geometry.clone()));
+        if geometry != last_fullscreen_geometry {
+            if let Some(application) = fullscreen_app {
+                println!("Fading out due to app {}", application.name.unwrap_or("unknown".to_owned()));
+            } else {
+                println!("Fading back in");
             }
-            last_fullscreen_app = fullscreen_app;
+            fade(fade_out, &mut screens_to_fade, &geometry, &fade_timing);
+            last_fullscreen_geometry = geometry;
         }
         std::thread::sleep(poll_interval);
+    }
+}
+
+fn get_screens(args: &Args) -> Vec<Screen> {
+    let x11_monitors: Vec<Rc<X11Monitor>> = {
+        let mut handle = xrandr::XHandle::open().unwrap();
+        handle.monitors().unwrap().iter().map(X11Monitor::new).map(Rc::new).collect()
+    };
+
+    let mut screens_to_fade: Vec<Screen> = get_compatible_screens().unwrap()
+        .filter(|s| !args.ignore.contains(&s.name)).collect();
+
+    for screen in &mut screens_to_fade {
+        println!("Screen {:?}, default {:?}, current {:?}", screen.name, screen.default_brightness, screen.current_brightness);
+        let monitor = x11_monitors.iter().find(|m| m.has_edid(&screen.edid));
+        screen.monitor = monitor.cloned();
+    }
+    screens_to_fade
+}
+
+fn fade(fade_out: bool, screens_to_fade: &mut Vec<Screen>, geometry: &Option<Geometry>, timing: &FadeTiming) {
+    let start_time = std::time::Instant::now();
+    loop {
+        let now = std::time::Instant::now();
+        let elapsed = now - start_time;
+        let progress = elapsed.as_secs_f64() / timing.duration.as_secs_f64();
+
+        for screen in screens_to_fade.iter_mut() {
+            let is_fullscreen = is_screen_fullscreen(geometry.as_ref(), screen.monitor.as_deref());
+            let fade_out_screen = fade_out && !is_fullscreen;
+            if (fade_out_screen && screen.current_brightness == 0) || (!fade_out_screen && screen.current_brightness >= screen.default_brightness) {
+                continue;
+            }
+            let brightness = if fade_out_screen {
+                (1.0 - progress) * screen.default_brightness as f64
+            } else { 
+                progress * screen.default_brightness as f64 
+            };
+        
+            screen.set_brightness(brightness as u16);
+        }
+
+        if progress >= 1.0 {
+            break;
+        }
+    
+        std::thread::sleep(timing.interval);
     }
 }
